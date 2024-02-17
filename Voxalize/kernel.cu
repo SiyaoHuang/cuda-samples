@@ -37,14 +37,150 @@ __all__ unsigned int morton3D(float x, float y, float z)
 
 #pragma endregion morton
 
+#pragma region boudingbox thrust
+__device__ float atomicMinFloat(float* addr, float value) {
+    int* address_as_i = (int*)addr;
+    int old = *address_as_i;
+    while (value < __int_as_float(old)) {
+        old = atomicCAS(address_as_i, old, __float_as_int(value));
+    }
+    return __int_as_float(old);
+}
+
+__device__ float atomicMaxFloat(float* addr, float value) {
+    int* address_as_i = (int*)addr;
+    int old = *address_as_i;
+    while (value > __int_as_float(old)) {
+        old = atomicCAS(address_as_i, old, __float_as_int(value));
+    }
+    return __int_as_float(old);
+}
+
+__global__ void boundingboxKernel(const float3* data, int size, float3 * minVal, float3* maxVal)
+{
+    int tid = threadIdx.x;
+    int i = blockIdx.x * blockDim.x + tid;
+    if (i >= size) {
+        return;
+    }
+    
+    float3 point = data[i];
+    atomicMinFloat(&minVal->x, point.x);
+    atomicMinFloat(&minVal->y, point.y);
+    atomicMinFloat(&minVal->z, point.z);
+
+    atomicMaxFloat(&maxVal->x, point.x);
+    atomicMaxFloat(&maxVal->y, point.y);
+    atomicMaxFloat(&maxVal->z, point.z);
+}
+
+__global__ void boundingboxKernelV2(const float3* data, int size, float3* minVal, float3* maxVal)
+{
+    extern __shared__ float3 sharedData[];
+    int tid = threadIdx.x;
+    int i = blockIdx.x * blockDim.x + tid;
+    if (i >= size) {
+        return;
+    }
+
+    sharedData[tid] = data[i];
+
+    __syncthreads();
+
+    float3 localMin = make_float3(FLT_MAX, FLT_MAX, FLT_MAX);
+    float3 localMax = make_float3(FLT_MIN, FLT_MIN, FLT_MIN);
+
+    if (tid == 0)
+    {    
+        for (int i = 0; i < blockDim.x && blockIdx.x * blockDim.x + i < size; i++) {
+            localMin.x = fminf(localMin.x, sharedData[i].x);
+            localMin.y = fminf(localMin.y, sharedData[i].y);
+            localMin.z = fminf(localMin.z, sharedData[i].z);
+
+            localMax.x = fmaxf(localMax.x, sharedData[i].x);
+            localMax.y = fmaxf(localMax.y, sharedData[i].y);
+            localMax.z = fmaxf(localMax.z, sharedData[i].z);
+        }
+    }
+
+    if (tid == 0) {
+        atomicMinFloat(&minVal->x, localMin.x);
+        atomicMinFloat(&minVal->y, localMin.y);
+        atomicMinFloat(&minVal->z, localMin.z);
+
+        atomicMaxFloat(&maxVal->x, localMax.x);
+        atomicMaxFloat(&maxVal->y, localMax.y);
+        atomicMaxFloat(&maxVal->z, localMax.z);
+    }
+
+}
+
+void cudaBoudingBox(std::vector<float3>& input)
+{
+
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+
+    float3* data;
+    float3 hostminVal = make_float3(FLT_MAX, FLT_MAX, FLT_MAX);
+    float3 hostmaxVal = make_float3(FLT_MIN, FLT_MIN, FLT_MIN);
+    int size = input.size();
+    int blockSize = 256;
+    int gridSize = (size + blockSize - 1) / blockSize;
+    float3* deviceMinVal;
+    float3* deviceMaxVal;
+
+    cudaMalloc(&data, size * sizeof(float3));
+    cudaMalloc(&deviceMinVal, sizeof(float3));
+    cudaMalloc(&deviceMaxVal, sizeof(float3));
+
+    cudaMemcpy(deviceMinVal, &hostminVal, sizeof(float3), cudaMemcpyHostToDevice);
+    cudaMemcpy(deviceMaxVal, &hostmaxVal, sizeof(float3), cudaMemcpyHostToDevice);
+    cudaMemcpy(data, input.data(), size * sizeof(float3), cudaMemcpyHostToDevice);
+
+    cudaEventRecord(start);
+#if 1
+    boundingboxKernel << < gridSize, blockSize >> > (data, size, deviceMinVal, deviceMaxVal);
+#else
+    const size_t smSz = blockSize * sizeof(float3);
+    boundingboxKernelV2 << < gridSize, blockSize, smSz >> > (data, size, deviceMinVal, deviceMaxVal);
+#endif
+    cudaDeviceSynchronize();
+
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+
+    cudaMemcpy(&hostminVal, deviceMinVal, sizeof(float3), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&hostmaxVal, deviceMaxVal, sizeof(float3), cudaMemcpyDeviceToHost);
+
+    float milliseconds = 0.0f;
+    cudaEventElapsedTime(&milliseconds, start, stop);
+
+    std::cout << "Kernel execution time: " << milliseconds << " ms\n";
+
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+
+    std::cout << "Bounding Box Min: (" << hostminVal.x << ", " << hostminVal.y << ", " << hostminVal.z << ")\n";
+    std::cout << "Bounding Box Max: (" << hostmaxVal.x << ", " << hostmaxVal.y << ", " << hostmaxVal.z << ")\n";
+    cudaFree(data);
+    cudaFree(deviceMinVal);
+    cudaFree(deviceMaxVal);
+}
+
+#pragma endregion
+
 // 相机参数
 float cameraRadius = 0.5f; // 相机到原点的距离
 float cameraAngle = 0.0f;  // 相机绕原点旋转的角度
 
-std::vector<Vertex> vertices; // Your parsed vertices
+//std::vector<Vertex> vertices; // Your parsed vertices
+std::vector<float3> vertices; // Your parsed vertices
 std::vector<Face> faces;     // Your parsed faces
 
-void range() {
+void cpuBoundingBox() {
     // 初始化边界框的最小和最大值
     float min_x = vertices[0].x;
     float min_y = vertices[0].y;
@@ -55,12 +191,12 @@ void range() {
 
     // 遍历所有顶点，更新最小和最大值
     for (const auto& vertex : vertices) {
-        min_x = std::min(min_x, vertex.x);
-        min_y = std::min(min_y, vertex.y);
-        min_z = std::min(min_z, vertex.z);
-        max_x = std::max(max_x, vertex.x);
-        max_y = std::max(max_y, vertex.y);
-        max_z = std::max(max_z, vertex.z);
+        min_x = std::fmin(min_x, vertex.x);
+        min_y = std::fmin(min_y, vertex.y);
+        min_z = std::fmin(min_z, vertex.z);
+        max_x = std::fmax(max_x, vertex.x);
+        max_y = std::fmax(max_y, vertex.y);
+        max_z = std::fmax(max_z, vertex.z);
     }
 
     // 打印边界框信息
@@ -72,6 +208,7 @@ void range() {
     std::cout << "Min Z: " << min_z << std::endl;
     std::cout << "Max Z: " << max_z << std::endl;
 }
+
 void reshape(int width, int height) {
     // 防止除以零
     if (height == 0) {
@@ -174,7 +311,8 @@ int main(int argc, char** argv)
 
     readObjFile(objFilename, vertices, faces);
     std::cout << "vertices:" << vertices.size() << ", faces:" << faces.size() << std::endl;
-    range();
-    run(argc, argv);
+    cudaBoudingBox(vertices);
+    cpuBoundingBox();
+    //run(argc, argv);
     return 0;
 }
