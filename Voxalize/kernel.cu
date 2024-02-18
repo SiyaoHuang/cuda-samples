@@ -24,6 +24,8 @@ std::vector<float3> vertices; // Your parsed vertices
 std::vector<Face> faces;     // Your parsed faces
 std::vector<float3> particles;
 
+float3 hostminVal;
+float3 hostmaxVal;
 
 #pragma region morton
 #define __all__ __host__ __device__
@@ -49,14 +51,7 @@ __all__ unsigned int morton3D(float x, float y, float z)
     return xx * 4 + yy * 2 + zz;
 }
 
-#pragma endregion morton
-
-__device__ __host__ float divid_length(float3 min, float3 maxIn) {
-    float3 range = maxIn - min;
-    float maxv = max(range.x, range.y);
-    maxv = max(maxv, range.z);
-    return maxv / DIVID_COUNT;
-}
+#pragma endregion
 
 #pragma region boudingbox cuda
 __device__ float atomicMinFloat(float* addr, float value) {
@@ -136,21 +131,6 @@ __global__ void boundingboxKernelV2(const float3* data, int size, float3* minVal
 
 }
 
-void generate_particle_within_bouding_box(float3 min_p, float3 max_p) {
-    float divid_len = divid_length(min_p, max_p);
-   
-    std::cout << "divid len:" << divid_len << std::endl;
-    if (divid_len == 0) {
-        return;
-    }
-    for (float x = min_p.x; x <= max_p.x; x += divid_len) {
-        for (float y = min_p.y; y <= max_p.y; y += divid_len) {
-            for (float z = min_p.z; z <= max_p.z; z += divid_len) {
-                particles.push_back(make_float3(x, y, z));
-            }
-        }
-    }
-}
 
 void cudaBoudingBox(std::vector<float3>& input)
 {
@@ -161,8 +141,8 @@ void cudaBoudingBox(std::vector<float3>& input)
 
 
     float3* data;
-    float3 hostminVal = make_float3(FLT_MAX, FLT_MAX, FLT_MAX);
-    float3 hostmaxVal = make_float3(FLT_MIN, FLT_MIN, FLT_MIN);
+    hostminVal = make_float3(FLT_MAX, FLT_MAX, FLT_MAX);
+    hostmaxVal = make_float3(FLT_MIN, FLT_MIN, FLT_MIN);
     int size = input.size();
     int blockSize = 256;
     int gridSize = (size + blockSize - 1) / blockSize;
@@ -203,8 +183,6 @@ void cudaBoudingBox(std::vector<float3>& input)
     std::cout << "Bounding Box Min: (" << hostminVal.x << ", " << hostminVal.y << ", " << hostminVal.z << ")\n";
     std::cout << "Bounding Box Max: (" << hostmaxVal.x << ", " << hostmaxVal.y << ", " << hostmaxVal.z << ")\n";
 
-    generate_particle_within_bouding_box(hostminVal, hostmaxVal);
-
     cudaFree(data);
     cudaFree(deviceMinVal);
     cudaFree(deviceMaxVal);
@@ -212,7 +190,7 @@ void cudaBoudingBox(std::vector<float3>& input)
 
 #pragma endregion
 
-
+#pragma region boudingbox cpu
 void cpuBoundingBox() {
     // 初始化边界框的最小和最大值
     float min_x = vertices[0].x;
@@ -241,7 +219,71 @@ void cpuBoundingBox() {
     std::cout << "Min Z: " << min_z << std::endl;
     std::cout << "Max Z: " << max_z << std::endl;
 }
+#pragma endregion
 
+#pragma region all particles within bouding box
+#define GENRATE_BY_CUDA 1
+__device__ __host__ float divid_length(float3 min, float3 maxIn) {
+    float3 range = maxIn - min;
+    float maxv = max(range.x, range.y);
+    maxv = max(maxv, range.z);
+    return maxv / DIVID_COUNT;
+}
+
+__global__ void cuda_generate_particle_within_bouding_box(float3* particlebuffer, float3 min_p, float divid_len, int x_len, int y_len, int z_len) {
+    int tid = threadIdx.x;
+    int i = blockIdx.x * blockDim.x + tid;
+    int index = i;
+    int count = x_len * y_len * z_len;
+    if (i >= count) {
+        return;
+    }
+    int zid = i / (x_len * y_len);
+    i = i - zid * (x_len * y_len);
+    int yid = i / (x_len);
+    i = i - yid * (x_len);
+    int xid = i;
+
+    particlebuffer[index] = min_p + make_float3(divid_len * xid, divid_len * yid, divid_len * zid);
+}
+
+void generate_particle_within_bouding_box(float3 min_p, float3 max_p) {
+    float divid_len = divid_length(min_p, max_p);
+
+    std::cout << "divid len:" << divid_len << std::endl;
+    if (divid_len == 0) {
+        return;
+    }
+#if GENRATE_BY_CUDA
+    float3* particlebuffer;
+    float3 dif_p = max_p - min_p;
+    int x_len = dif_p.x / divid_len+1;
+    int y_len = dif_p.y / divid_len+1;
+    int z_len = dif_p.z / divid_len+1;
+    int count = x_len * y_len * z_len;
+    std::cout << "len:" << x_len << ", " << y_len << ", " << z_len << std::endl;
+    cudaMalloc(&particlebuffer, count * sizeof(float3));
+    int blocksize = 256;
+    int gridcount = (count + blocksize - 1) / blocksize;
+    cuda_generate_particle_within_bouding_box << <gridcount, blocksize  >> > (particlebuffer, min_p, divid_len, x_len, y_len, z_len);
+
+    particles.resize(count);
+    cudaMemcpy(particles.data(), particlebuffer, count * sizeof(float3), cudaMemcpyDeviceToHost);
+    cudaFree(particlebuffer);
+
+#else
+    for (float x = min_p.x; x <= max_p.x; x += divid_len) {
+        for (float y = min_p.y; y <= max_p.y; y += divid_len) {
+            for (float z = min_p.z; z <= max_p.z; z += divid_len) {
+                particles.push_back(make_float3(x, y, z));
+            }
+        }
+    }
+#endif
+}
+#pragma endregion
+
+#pragma region freeglut render and interact
 void reshape(int width, int height) {
     // 防止除以零
     if (height == 0) {
@@ -330,6 +372,7 @@ void run(int argc, char** argv) {
     // Enter GLUT main loop
     glutMainLoop();
 }
+#pragma endregion
 
 int main(int argc, char** argv)
 {
@@ -346,6 +389,7 @@ int main(int argc, char** argv)
     readObjFile(objFilename, vertices, faces);
     std::cout << "vertices:" << vertices.size() << ", faces:" << faces.size() << std::endl;
     cudaBoudingBox(vertices);
+    generate_particle_within_bouding_box(hostminVal, hostmaxVal);
     cpuBoundingBox();
     run(argc, argv);
     return 0;
