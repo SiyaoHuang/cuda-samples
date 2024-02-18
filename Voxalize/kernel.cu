@@ -7,9 +7,23 @@
 
 #include <stdio.h>
 #include "obj_loader.h"
+#include "helper_math.h"
 #include <iostream>
 
 #include <GL/freeglut.h>
+
+#define DIVID_COUNT 50;
+
+
+// 相机参数
+float cameraRadius = 0.5f; // 相机到原点的距离
+float cameraAngle = 0.0f;  // 相机绕原点旋转的角度
+
+//std::vector<Vertex> vertices; // Your parsed vertices
+std::vector<float3> vertices; // Your parsed vertices
+std::vector<Face> faces;     // Your parsed faces
+std::vector<float3> particles;
+
 
 #pragma region morton
 #define __all__ __host__ __device__
@@ -37,7 +51,14 @@ __all__ unsigned int morton3D(float x, float y, float z)
 
 #pragma endregion morton
 
-#pragma region boudingbox thrust
+__device__ __host__ float divid_length(float3 min, float3 maxIn) {
+    float3 range = maxIn - min;
+    float maxv = max(range.x, range.y);
+    maxv = max(maxv, range.z);
+    return maxv / DIVID_COUNT;
+}
+
+#pragma region boudingbox cuda
 __device__ float atomicMinFloat(float* addr, float value) {
     int* address_as_i = (int*)addr;
     int old = *address_as_i;
@@ -115,6 +136,22 @@ __global__ void boundingboxKernelV2(const float3* data, int size, float3* minVal
 
 }
 
+void generate_particle_within_bouding_box(float3 min_p, float3 max_p) {
+    float divid_len = divid_length(min_p, max_p);
+   
+    std::cout << "divid len:" << divid_len << std::endl;
+    if (divid_len == 0) {
+        return;
+    }
+    for (float x = min_p.x; x <= max_p.x; x += divid_len) {
+        for (float y = min_p.y; y <= max_p.y; y += divid_len) {
+            for (float z = min_p.z; z <= max_p.z; z += divid_len) {
+                particles.push_back(make_float3(x, y, z));
+            }
+        }
+    }
+}
+
 void cudaBoudingBox(std::vector<float3>& input)
 {
 
@@ -165,6 +202,9 @@ void cudaBoudingBox(std::vector<float3>& input)
 
     std::cout << "Bounding Box Min: (" << hostminVal.x << ", " << hostminVal.y << ", " << hostminVal.z << ")\n";
     std::cout << "Bounding Box Max: (" << hostmaxVal.x << ", " << hostmaxVal.y << ", " << hostmaxVal.z << ")\n";
+
+    generate_particle_within_bouding_box(hostminVal, hostmaxVal);
+
     cudaFree(data);
     cudaFree(deviceMinVal);
     cudaFree(deviceMaxVal);
@@ -172,13 +212,6 @@ void cudaBoudingBox(std::vector<float3>& input)
 
 #pragma endregion
 
-// 相机参数
-float cameraRadius = 0.5f; // 相机到原点的距离
-float cameraAngle = 0.0f;  // 相机绕原点旋转的角度
-
-//std::vector<Vertex> vertices; // Your parsed vertices
-std::vector<float3> vertices; // Your parsed vertices
-std::vector<Face> faces;     // Your parsed faces
 
 void cpuBoundingBox() {
     // 初始化边界框的最小和最大值
@@ -237,7 +270,7 @@ void display() {
         0.0, 0.0, 0.0,          // 观察点
         0.0, 1.0, 0.0);         // 上方向
 
-#if 1 // triangle
+    // triangle
     glBegin(GL_TRIANGLES);
     for (const auto& face : faces) {
         glColor3f(1.0, 0.0, 0.0);
@@ -247,15 +280,16 @@ void display() {
         glColor3f(0.0, 0.0, 1.0);
         glVertex3f(vertices[face.v3].x, vertices[face.v3].y, vertices[face.v3].z);
     }
-#else// point
-    glPointSize(3.0f);
-    glBegin(GL_POINTS);
-    for (const auto& vertice : vertices) {
-        glColor3f(1.0f, 1.0f, 1.0f); // White color for particles
-        glVertex2f(vertice.x, vertice.y);
-    }
-#endif
     glEnd();
+    // point
+    //glPointSize(3.0f);
+    glBegin(GL_POINTS);
+    for (const auto& vertice : particles) {
+        glColor3f(1.0f, 1.0f, 1.0f); // White color for particles
+        glVertex3f(vertice.x, vertice.y, vertice.z);
+    }
+    glEnd();
+
 
     // 检查 OpenGL 错误状态
     GLenum error = glGetError();
@@ -313,6 +347,6 @@ int main(int argc, char** argv)
     std::cout << "vertices:" << vertices.size() << ", faces:" << faces.size() << std::endl;
     cudaBoudingBox(vertices);
     cpuBoundingBox();
-    //run(argc, argv);
+    run(argc, argv);
     return 0;
 }
