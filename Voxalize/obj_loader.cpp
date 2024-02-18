@@ -40,7 +40,7 @@ void readObjFile(const char* filename, std::vector<Vertex>& vertices, std::vecto
 }
 
 // Read .obj file and parse vertices and faces
-void readObjFile(const char* filename, std::vector<float3>& vertices, std::vector<Face>& faces) {
+void readObjFile(const char* filename, std::vector<float3>& vertices, std::vector<int3>& faces) {
     std::ifstream objFile(filename);
     std::cout << "getting file" << filename << std::endl;
     if (!objFile.is_open()) {
@@ -65,10 +65,10 @@ void readObjFile(const char* filename, std::vector<float3>& vertices, std::vecto
             vertices.push_back(vertex);
         }
         else if (type == 'f') {
-            Face face;
-            iss >> face.v1 >> face.v2 >> face.v3;
+            int3 face;
+            iss >> face.x >> face.y >> face.z;
             // Adjust indices (assuming 1-based indices in .obj file)
-            face.v1--; face.v2--; face.v3--;
+            face.x--; face.y--; face.z--;
             faces.push_back(face);
         }
     }

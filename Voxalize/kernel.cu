@@ -13,6 +13,7 @@
 #include <GL/freeglut.h>
 
 #define DIVID_COUNT 50;
+#define TEST_CODE 0;
 
 
 // 相机参数
@@ -21,7 +22,7 @@ float cameraAngle = 0.0f;  // 相机绕原点旋转的角度
 
 //std::vector<Vertex> vertices; // Your parsed vertices
 std::vector<float3> vertices; // Your parsed vertices
-std::vector<Face> faces;     // Your parsed faces
+std::vector<int3> faces;     // Your parsed faces
 std::vector<float3> particles;
 
 float3 hostminVal;
@@ -50,6 +51,44 @@ __all__ unsigned int morton3D(float x, float y, float z)
     unsigned int zz = expandBits((unsigned int)z);
     return xx * 4 + yy * 2 + zz;
 }
+
+__all__ unsigned int invertBits(unsigned int v) {
+    v = v & 0x49249249u;
+    v = (v | (v >> 2)) & 0xC30C30C3u;
+    v = (v | (v >> 4)) & 0x0F00F00Fu;
+    v = (v | (v >> 8)) & 0xFF0000FFu;
+    v = (v | (v >> 16)) & 0x0000FFFFu;
+    return v;
+}
+
+// Converts a 30-bit Morton code back to 3D float coordinates
+__all__ void mortonToFloat(unsigned int morton, float& x, float& y, float& z) {
+    unsigned int xx = invertBits(morton >> 0);
+    unsigned int yy = invertBits(morton >> 1);
+    unsigned int zz = invertBits(morton >> 2);
+
+    // Normalize the values back to the [0,1] range
+    x = static_cast<float>(xx) / 1024.0f;
+    y = static_cast<float>(yy) / 1024.0f;
+    z = static_cast<float>(zz) / 1024.0f;
+}
+#if TEST_CODE
+void test_morton_convert() {
+    float x = 0.1;
+    float y = 0.9;
+    float z = 0.34;
+    std::cout << "test morton" << std::endl;
+    std::cout << x << "," << y << "," << z << std::endl;
+    uint code = morton3D(x, y, z);
+    std::cout << "morton:" << code << std::endl;
+    float rx = 0;
+    float ry = 0;
+    float rz = 0;
+    mortonToFloat(code, rx, ry, rz);
+    std::cout << "re morton" << rx << "," << ry << "," << rz << std::endl;
+}
+#endif // TEST_CODE
+
 
 #pragma endregion
 
@@ -109,13 +148,9 @@ __global__ void boundingboxKernelV2(const float3* data, int size, float3* minVal
     if (tid == 0)
     {    
         for (int i = 0; i < blockDim.x && blockIdx.x * blockDim.x + i < size; i++) {
-            localMin.x = fminf(localMin.x, sharedData[i].x);
-            localMin.y = fminf(localMin.y, sharedData[i].y);
-            localMin.z = fminf(localMin.z, sharedData[i].z);
+            localMin = fminf(localMin, sharedData[i]);
 
-            localMax.x = fmaxf(localMax.x, sharedData[i].x);
-            localMax.y = fmaxf(localMax.y, sharedData[i].y);
-            localMax.z = fmaxf(localMax.z, sharedData[i].z);
+            localMax = fmaxf(localMax, sharedData[i]);
         }
     }
 
@@ -283,6 +318,126 @@ void generate_particle_within_bouding_box(float3 min_p, float3 max_p) {
 }
 #pragma endregion
 
+#pragma region paricle from triangles
+
+#define MAX_PARTICLES_COUNT 70000
+__device__ __inline__ void put_data(float3* data, int* current_index, float3 value) {
+    int returnIndex = atomicAdd(current_index, 1);
+    if (returnIndex >= MAX_PARTICLES_COUNT) {
+        return;
+    }
+    data[returnIndex] = value;
+
+}
+
+__device__ __inline__ int3 toIndex(float3 min, float3 val, float divid_len) {
+    float3 dif = val - min;
+    return make_int3(
+        (int)(dif.x / divid_len),
+        (int)(dif.y / divid_len),
+        (int)(dif.z / divid_len)
+    );
+}
+
+__device__ __inline__ float3 toPosition(float3 min, int x, int y, int z, float divid_len) {
+    return make_float3(
+        min.x + x * divid_len,
+        min.y + y * divid_len,
+        min.z + z * divid_len
+    );
+}
+
+__device__ __inline__ float3 toPosition(float3 min, int3 val, float divid_len) {
+    return make_float3(
+        min.x + val.x * divid_len,
+        min.y + val.y * divid_len,
+        min.z + val.z * divid_len
+    );
+}
+
+__device__ __inline__ float3 toGrid(float3 min, float3 val, float divid_len) {
+    float3 dif = val - min;
+    return make_float3(
+        min.x + (uint)(dif.x / divid_len) * divid_len,
+        min.y + (uint)(dif.y / divid_len) * divid_len,
+        min.z + (uint)(dif.z / divid_len) * divid_len
+    );
+}
+
+__global__ void cuda_generate_particles_from_triangles(float3* vertices, int3* faces, float3* particles, size_t face_count, float3 min, float divid_len, int* particle_count) {
+    int tid = threadIdx.x;
+    int index = blockIdx.x * blockDim.x + tid;
+
+    if (index >= face_count) {
+        return;
+    }
+    int3 face = faces[index];
+    float3 v1 = vertices[face.x];
+    float3 v2 = vertices[face.y];
+    float3 v3 = vertices[face.z];
+#if 0 // vertice grid position
+    put_data(particles, particle_count, toGrid(min, v1, divid_len));
+    put_data(particles, particle_count, toGrid(min, v2, divid_len));
+    put_data(particles, particle_count, toGrid(min, v3, divid_len));
+#endif
+
+    float3 minv = v1;
+    minv = fminf(minv, v2);
+    minv = fminf(minv, v3);
+    float3 maxv = v1;
+    maxv = fmaxf(maxv, v2);
+    maxv = fmaxf(maxv, v3);
+    int3 lowIndex = toIndex(min, minv, divid_len);
+    int3 highIndex = toIndex(min, maxv, divid_len);
+
+    for (int x = lowIndex.x; x <= highIndex.x; x++) {
+        for (int y = lowIndex.y; y <= highIndex.y; y++) {
+            for (int z = lowIndex.z; z <= highIndex.z; z++) {
+                put_data(particles, particle_count, toPosition(min, x, y, z, divid_len));
+            }
+        }
+    }
+
+}
+
+void generate_particles_from_triangles() {
+    float divid_len = divid_length(hostminVal, hostmaxVal);
+    
+    float3* deviceVertices;
+    int3* deviceFaces;
+    float3* deviceParticles;
+    int* particle_count;
+
+    cudaMalloc(&deviceVertices, vertices.size() * sizeof(float3));
+    cudaMalloc(&deviceFaces, faces.size() * sizeof(int3));
+    cudaMalloc(&deviceParticles, MAX_PARTICLES_COUNT * sizeof(float3));
+    cudaMalloc(&particle_count, sizeof(int));
+
+    cudaMemcpy(deviceVertices, vertices.data(), vertices.size() * sizeof(float3), cudaMemcpyHostToDevice);
+    cudaMemcpy(deviceFaces, faces.data(), faces.size() * sizeof(int3), cudaMemcpyHostToDevice);
+    int host_particle_count = 0;
+    cudaMemcpy(&particle_count, &host_particle_count, sizeof(int), cudaMemcpyHostToDevice);
+
+    size_t face_count = faces.size();
+    size_t blocksize = 256;
+    size_t gridcount = (face_count + blocksize - 1) / blocksize;
+
+    cuda_generate_particles_from_triangles << <gridcount, blocksize >> > (deviceVertices, deviceFaces, deviceParticles, face_count, hostminVal, divid_len, particle_count);
+    cudaMemcpy(&host_particle_count, particle_count, sizeof(int), cudaMemcpyDeviceToHost);
+    std::cout << "getting particle count:" << host_particle_count << std::endl;
+    host_particle_count = min(host_particle_count, MAX_PARTICLES_COUNT);
+
+    particles.resize(host_particle_count);
+    cudaMemcpy(particles.data(), deviceParticles, host_particle_count * sizeof(float3), cudaMemcpyDeviceToHost);
+    
+    cudaFree(deviceVertices);
+    cudaFree(deviceFaces);
+    cudaFree(deviceParticles);
+    //cudaFree(deviceCount);
+}
+
+#pragma endregion
+
 #pragma region freeglut render and interact
 void reshape(int width, int height) {
     // 防止除以零
@@ -311,18 +466,20 @@ void display() {
     gluLookAt(cameraX, 0.5, cameraY,  // 相机位置
         0.0, 0.0, 0.0,          // 观察点
         0.0, 1.0, 0.0);         // 上方向
-
+#if 0
     // triangle
     glBegin(GL_TRIANGLES);
     for (const auto& face : faces) {
         glColor3f(1.0, 0.0, 0.0);
-        glVertex3f(vertices[face.v1].x, vertices[face.v1].y, vertices[face.v1].z);
+        glVertex3f(vertices[face.x].x, vertices[face.x].y, vertices[face.x].z);
         glColor3f(0.0, 1.0, 0.0);
-        glVertex3f(vertices[face.v2].x, vertices[face.v2].y, vertices[face.v2].z);
+        glVertex3f(vertices[face.y].x, vertices[face.y].y, vertices[face.y].z);
         glColor3f(0.0, 0.0, 1.0);
-        glVertex3f(vertices[face.v3].x, vertices[face.v3].y, vertices[face.v3].z);
+        glVertex3f(vertices[face.z].x, vertices[face.z].y, vertices[face.z].z);
     }
     glEnd();
+#endif
+
     // point
     //glPointSize(3.0f);
     glBegin(GL_POINTS);
@@ -332,7 +489,7 @@ void display() {
     }
     glEnd();
 
-
+#if TEST_CODE
     // 检查 OpenGL 错误状态
     GLenum error = glGetError();
     if (error != GL_NO_ERROR) {
@@ -341,6 +498,7 @@ void display() {
     else {
         std::cout << "sucess" << std::endl;
     }
+#endif
 
     glutSwapBuffers();
 }
@@ -376,6 +534,9 @@ void run(int argc, char** argv) {
 
 int main(int argc, char** argv)
 {
+#if TEST_CODE
+    test_morton_convert();
+#endif
     // cudaDeviceReset must be called before exiting in order for profiling and
     // tracing tools such as Nsight and Visual Profiler to show complete traces.
     cudaError_t cudaStatus = cudaDeviceReset();
@@ -389,7 +550,12 @@ int main(int argc, char** argv)
     readObjFile(objFilename, vertices, faces);
     std::cout << "vertices:" << vertices.size() << ", faces:" << faces.size() << std::endl;
     cudaBoudingBox(vertices);
+#if 0
     generate_particle_within_bouding_box(hostminVal, hostmaxVal);
+#else
+    generate_particles_from_triangles();
+#endif
+
     cpuBoundingBox();
     run(argc, argv);
     return 0;

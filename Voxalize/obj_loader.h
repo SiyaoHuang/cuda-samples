@@ -13,4 +13,4 @@ struct Face {
 // Read .obj file and parse vertices and faces
 void readObjFile(const char* filename, std::vector<Vertex>& vertices, std::vector<Face>& faces);
 
-void readObjFile(const char* filename, std::vector<float3>& vertices, std::vector<Face>& faces);
+void readObjFile(const char* filename, std::vector<float3>& vertices, std::vector<int3>& faces);
