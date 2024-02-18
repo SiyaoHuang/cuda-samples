@@ -13,6 +13,12 @@
 
 #include <GL/freeglut.h>
 #include <algorithm>
+#include <chrono>
+
+#include "thrust/host_vector.h"
+#include "thrust/device_vector.h"
+#include "thrust/sort.h"
+#include "thrust/unique.h"
 
 #define DIVID_COUNT 100;
 #define TEST_CODE 0;
@@ -171,7 +177,6 @@ __global__ void boundingboxKernelV2(const float3* data, int size, float3* minVal
 
 void cudaBoudingBox(std::vector<float3>& input)
 {
-
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
@@ -377,6 +382,12 @@ __global__ void cuda_generate_particles_from_triangles(float3* vertices, int3* f
     float3 v1 = vertices[face.x];
     float3 v2 = vertices[face.y];
     float3 v3 = vertices[face.z];
+
+    float3 v12 = v2 - v1;
+    float3 v13 = v3 - v1;
+    float3 n = cross(v12, v13);
+    n = normalize(n);
+
 #if 0 // vertice grid position
     put_data(particles, particle_count, toGrid(min, v1, divid_len));
     put_data(particles, particle_count, toGrid(min, v2, divid_len));
@@ -395,7 +406,13 @@ __global__ void cuda_generate_particles_from_triangles(float3* vertices, int3* f
     for (int x = lowIndex.x; x <= highIndex.x; x++) {
         for (int y = lowIndex.y; y <= highIndex.y; y++) {
             for (int z = lowIndex.z; z <= highIndex.z; z++) {
-                put_data(particles, particle_count, toPosition(min, x, y, z, divid_len));
+                float3 p = toPosition(min, x, y, z, divid_len);
+                float3 v1p = p - v1;
+                float dis = dot(v1p, p);
+                float range = 0.0001;
+                if (dis < range && dis>- range) {
+                    put_data(particles, particle_count, p);
+                }
             }
         }
     }
@@ -441,11 +458,26 @@ void generate_particles_from_triangles() {
 #pragma endregion
 
 #pragma region remove duplication
+#define CUDA_SORT_UNIQUE 0
 unsigned int mortonInRange(float3 v) {
     float3 shift = v - hostminVal;
     float3 range = hostmaxVal - hostminVal;
     return morton3D(shift.x / range.x, shift.y / range.y, shift.z / range.z);
 }
+
+#if CUDA_SORT_UNIQUE
+struct comparePositionStruct {
+    __device__ bool operator()(float3& a, float3& b) {
+        return a.x < b.x && a.y < b.y && a.z < b.z;
+    }
+};
+
+struct checkSamePositionStruct {
+    __device__ bool operator()(float3& a, float3& b) {
+        return a.x == b.x && a.y == b.y && a.z == b.z;
+    }
+};
+#endif
 
 bool comparePosition(float3 a, float3 b) {
     
@@ -457,11 +489,59 @@ bool checkSamePosition(float3 a, float3 b) {
     return mortonInRange(a) == mortonInRange(b);
 }
 
-void remove_duplicate_particles() {
+void remove_duplicate_particles() 
+{
+#if !CUDA_SORT_UNIQUE // cpu remove
+    auto start = std::chrono::high_resolution_clock::now();
     std::sort(particles.begin(), particles.end(), comparePosition);
+    auto endsort = std::chrono::high_resolution_clock::now();
     auto unique_end = std::unique(particles.begin(), particles.end(), checkSamePosition);
     particles.erase(unique_end, particles.end());
+    auto endunique = std::chrono::high_resolution_clock::now();
+
+    // Calculate the elapsed time in milliseconds
+    auto durationsort = std::chrono::duration_cast<std::chrono::milliseconds>(endsort - start).count();
+    auto durationunique = std::chrono::duration_cast<std::chrono::milliseconds>(endunique - endsort).count();
+
+    std::cout << "sort time:" << durationsort <<", unique:"<<durationunique<< std::endl;
     std::cout << "new size:" << particles.size() << std::endl;
+#else
+    // TODO: paricles are too large, result in memory issue.
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    cudaEventRecord(start);
+
+    std::cout << "particle size:" << particles.size() << std::endl;
+    std::cout <<"vertice size:"<< vertices.size() << std::endl;
+
+    thrust::host_vector<float3> host_vertices(particles.begin(), particles.end());
+    thrust::device_vector<float3> device_vertices(host_vertices.begin(), host_vertices.end());
+    thrust::copy(host_vertices.begin(), host_vertices.end(), device_vertices.begin());
+    thrust::sort_by_key(device_vertices.begin(), device_vertices.end(), device_vertices.begin(), comparePositionStruct());
+
+    //thrust::host_vector<float3> host_vertices(particles.begin(), particles.end());
+    //thrust::device_vector<float3> device_vertices(particles.begin(), particles.end());
+    //thrust::copy(host_vertices.begin(), host_vertices.end(), device_vertices.begin());
+    //thrust::sort_by_key(device_vertices.begin(), device_vertices.end(), device_vertices.begin(), comparePositionStruct());
+
+    auto unique_end = thrust::unique_by_key(device_vertices.begin(), device_vertices.end(), device_vertices.begin(), checkSamePositionStruct());
+    device_vertices.erase(unique_end.first, device_vertices.end());
+
+    //host_vertices = device_vertices;
+    
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+
+    float milliseconds = 0.0f;
+    cudaEventElapsedTime(&milliseconds, start, stop);
+
+    std::cout << "Kernel execution time: " << milliseconds << " ms\n";
+
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+#endif
 }
 #pragma region
 
