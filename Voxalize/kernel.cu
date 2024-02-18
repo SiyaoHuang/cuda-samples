@@ -2,6 +2,7 @@
 #include "cuda_runtime.h"
 #include "device_atomic_functions.h"
 #include "device_launch_parameters.h"
+
 #include <vector>
 #include <string>
 
@@ -11,8 +12,9 @@
 #include <iostream>
 
 #include <GL/freeglut.h>
+#include <algorithm>
 
-#define DIVID_COUNT 50;
+#define DIVID_COUNT 100;
 #define TEST_CODE 0;
 
 
@@ -320,7 +322,7 @@ void generate_particle_within_bouding_box(float3 min_p, float3 max_p) {
 
 #pragma region paricle from triangles
 
-#define MAX_PARTICLES_COUNT 70000
+#define MAX_PARTICLES_COUNT 400000
 __device__ __inline__ void put_data(float3* data, int* current_index, float3 value) {
     int returnIndex = atomicAdd(current_index, 1);
     if (returnIndex >= MAX_PARTICLES_COUNT) {
@@ -437,6 +439,31 @@ void generate_particles_from_triangles() {
 }
 
 #pragma endregion
+
+#pragma region remove duplication
+unsigned int mortonInRange(float3 v) {
+    float3 shift = v - hostminVal;
+    float3 range = hostmaxVal - hostminVal;
+    return morton3D(shift.x / range.x, shift.y / range.y, shift.z / range.z);
+}
+
+bool comparePosition(float3 a, float3 b) {
+    
+    return mortonInRange(a) < mortonInRange(b);
+}
+
+bool checkSamePosition(float3 a, float3 b) {
+
+    return mortonInRange(a) == mortonInRange(b);
+}
+
+void remove_duplicate_particles() {
+    std::sort(particles.begin(), particles.end(), comparePosition);
+    auto unique_end = std::unique(particles.begin(), particles.end(), checkSamePosition);
+    particles.erase(unique_end, particles.end());
+    std::cout << "new size:" << particles.size() << std::endl;
+}
+#pragma region
 
 #pragma region freeglut render and interact
 void reshape(int width, int height) {
@@ -555,6 +582,7 @@ int main(int argc, char** argv)
 #else
     generate_particles_from_triangles();
 #endif
+    remove_duplicate_particles();
 
     cpuBoundingBox();
     run(argc, argv);
